@@ -1,0 +1,5 @@
+root = true
+
+[*.cs]
+dotnet_diagnostic.CA1502.severity = warning
+dotnet_code_quality.CA1502.threshold = 10

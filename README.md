@@ -1,10 +1,10 @@
 # XStorage
 
-XStorage is a single-node object storage server for applications that need private buckets and S3-style object operations. It runs on .NET 10 and stores data on a local filesystem on Linux, macOS, or Windows. Each application gets its own credentials and byte quota.
+XStorage is a single-node object storage server for applications. It stores objects on a local filesystem and runs on .NET 10 on Linux, macOS, or Windows. Each application gets separate credentials and a byte quota. A bucket groups an application's objects.
 
-The server exposes a small [S3 API subset](#s3-api-subset) and a separate [admin API](#provision-applications). It does not call AWS. You can connect another project with the [optional .NET client](#optional-net-client-library) or a compatible S3 client. This is not a full S3 implementation.
+XStorage provides a limited S3-compatible API for object operations and a separate [admin API](#provision-applications) for application setup. It does not connect to AWS. Connect another project with the [optional .NET client](#optional-net-client-library) or an S3-compatible client. See the [supported operations](#s3-api-subset); XStorage does not implement all of Amazon S3. For the architecture article and implementation plans, see the [XStorage documentation](https://app.notion.com/p/3eda5d68fcdd81798780da0c8d5689c7).
 
-To use it:
+To connect a project:
 
 1. [Start the server](#run-locally).
 2. [Create an application](#provision-applications) and save its access key and secret.
@@ -14,16 +14,16 @@ To use it:
 
 - Linux, macOS, or Windows on one host.
 - .NET 10 SDK to build or run from source.
-- Linux or macOS: one local filesystem with atomic same-directory rename and working file and directory flush operations.
-- Windows: a local NTFS volume with atomic same-volume rename and working write-through operations.
+- Linux or macOS: a local filesystem that supports atomic same-directory rename and file and directory flush operations.
+- Windows: a local NTFS volume that supports atomic same-volume rename and write-through operations.
 - A dedicated service account that owns the data root.
 - A reverse proxy that terminates HTTPS for network clients.
 
-Network filesystems are not supported. Windows storage uses protected ACLs for the service identity and LocalSystem. See the [durability guarantee](#durability-guarantee) before storing important data.
+XStorage does not support network filesystems. On Windows, it protects data with access control lists (ACLs) for the service identity and LocalSystem. Review the [durability guarantee](#durability-guarantee) before storing important data.
 
 ## Run locally
 
-From the repository root, set the four required variables and start the server. These examples create temporary secrets for a local trial. For lasting data, keep the same keys across restarts in a protected secret store.
+From the repository root, set the four required environment variables and start the server. These commands generate keys for a local trial. For persistent data, store the keys in a protected secret store and reuse the same values after each restart.
 
 Linux or macOS:
 
@@ -45,65 +45,79 @@ $env:XSTORAGE_CONTINUATION_TOKEN_KEY = [Convert]::ToBase64String([Security.Crypt
 dotnet run --project .\src\XStorage.Server
 ```
 
-The S3 endpoint listens on `http://127.0.0.1:9000`. The admin API listens on `http://127.0.0.1:9001`. Keep the process running while clients use it. Ctrl+C stops both listeners. The service allows only one process per data root.
+The S3 endpoint listens on `http://127.0.0.1:9000`. The admin API listens on `http://127.0.0.1:9001`. Keep the server running while clients use it. Press Ctrl+C to stop both listeners. Only one server process can use a data root at a time.
 
 ## Configuration
 
-The process reads these environment variables at startup:
+XStorage reads these environment variables when it starts:
 
-- **`XSTORAGE_DATA_ROOT` (required):** Absolute path to the service-owned data root.
-- **`XSTORAGE_ADMIN_TOKEN` (required):** Static bearer token with at least 32 printable ASCII characters and no spaces. Store it in a secret manager.
-- **`XSTORAGE_APP_ENCRYPTION_KEY` (required):** Base64 encoding of 32 random bytes. This key encrypts application secrets at rest.
-- **`XSTORAGE_CONTINUATION_TOKEN_KEY` (required):** Base64 encoding of 32 random bytes. Keep this value stable across restarts so list tokens remain valid.
-- **`XSTORAGE_DATA_URL` (optional):** S3 listener URL. Default: `http://127.0.0.1:9000`.
-- **`XSTORAGE_ADMIN_URL` (optional):** Admin listener URL. Default: `http://127.0.0.1:9001`.
-- **`XSTORAGE_MAX_OBJECT_BYTES` (optional):** Maximum object size. Default: `26214400` bytes (25 MiB).
-- **`XSTORAGE_MAX_OBJECTS_PER_APPLICATION` (optional):** Maximum committed object records for one application. Default: `10000`. Empty objects count.
-- **`XSTORAGE_MAX_BUCKETS_PER_APPLICATION` (optional):** Maximum owned buckets for one application. Default: `100`.
-- **`XSTORAGE_TRUSTED_PROXIES` (optional):** Comma-separated proxy IP addresses allowed to set forwarded scheme and client address headers. Default: no trusted proxies.
+| Variable | Required | Purpose / default |
+| --- | --- | --- |
+| `XSTORAGE_DATA_ROOT` | Yes | Absolute path to the service-owned data root. |
+| `XSTORAGE_ADMIN_TOKEN` | Yes | Static bearer token with at least 32 printable ASCII characters and no spaces. |
+| `XSTORAGE_APP_ENCRYPTION_KEY` | Yes | Base64-encoded 32-byte key used to encrypt application secrets at rest. |
+| `XSTORAGE_CONTINUATION_TOKEN_KEY` | Yes | Base64-encoded 32-byte key used to sign list continuation tokens. |
+| `XSTORAGE_DATA_URL` | No | S3 listener URL. Default: `http://127.0.0.1:9000`. |
+| `XSTORAGE_ADMIN_URL` | No | Admin listener URL. Default: `http://127.0.0.1:9001`. |
+| `XSTORAGE_MAX_OBJECT_BYTES` | No | Maximum object size. Default: `26214400` bytes (25 MiB). |
+| `XSTORAGE_MAX_OBJECTS_PER_APPLICATION` | No | Maximum committed objects per application. Default: `10000`. Empty objects count. |
+| `XSTORAGE_MAX_BUCKETS_PER_APPLICATION` | No | Maximum owned buckets per application. Default: `100`. |
+| `XSTORAGE_TRUSTED_PROXIES` | No | Comma-separated proxy IPs trusted to set forwarded scheme and client address headers. Default: none. |
 
-The encryption and continuation keys must each decode to exactly 32 bytes. Keep all four required settings stable for a persistent deployment. The application encryption key is needed to read stored credentials after a restart. Do not place secrets in source control, command arguments, logs, or browser code. Keep them in a secret manager or equivalent protected service configuration.
+Both encryption keys must decode to exactly 32 bytes. For persistent deployments, keep all four required values unchanged between restarts. XStorage needs the application encryption key to read stored application credentials. Store secrets in a secret manager or protected service configuration. Do not put them in source control, command arguments, logs, or browser code.
 
-The server refuses relative data roots, filesystem roots, unsafe data trees, invalid key lengths, invalid limits, and listener addresses that use the same host and port. The data tree rejects symbolic links and other reparse points. The service applies owner-only filesystem permissions on Linux and macOS. On Windows, it applies protected ACLs for the service identity and LocalSystem.
+XStorage rejects relative paths, filesystem roots, unsafe data trees, invalid key lengths, invalid limits, and listener addresses that share the same host and port. It also rejects symbolic links and other reparse points inside the data tree. On Linux and macOS, only the data-root owner can access the data. On Windows, protected ACLs grant access to the service identity and LocalSystem.
 
-The process releases the data root lock on normal shutdown. Unix processes also handle SIGTERM.
+XStorage releases its data-root lock during normal shutdown. On Unix, it also handles SIGTERM.
 
 ## Network and TLS
 
-Keep both listeners on loopback for the default deployment. Do not expose the admin port through the data-plane proxy. Operators can reach the admin port through a local provisioning script or an SSH tunnel.
+Keep both listeners on loopback by default. Do not expose the admin port through the reverse proxy used for S3 traffic. Operators can use a local script or an SSH tunnel to reach the admin API.
 
-Terminate HTTPS at a trusted reverse proxy for network clients. Configure the proxy to preserve the original `Host`, path, raw query, and signed headers. Set `XSTORAGE_TRUSTED_PROXIES` to the proxy IP addresses. The server trusts `X-Forwarded-Proto` only from those addresses. An S3 request that uses `UNSIGNED-PAYLOAD` succeeds only when the request is HTTPS or a configured proxy reports HTTPS.
+For network access, terminate HTTPS at a trusted reverse proxy. Configure it to preserve the original `Host`, path, raw query, and signed headers. Set `XSTORAGE_TRUSTED_PROXIES` to the proxy's IP addresses. XStorage trusts `X-Forwarded-Proto` only from those addresses. Requests that use `UNSIGNED-PAYLOAD` must use HTTPS, either directly or as reported by a trusted proxy.
 
-If an operator binds either listener to a non-loopback address, the server requires the request to be HTTPS after trusted forwarded headers are applied. Do not bind the admin listener to a public interface unless the operator has configured HTTPS termination and restricted access to the operator network.
+If either listener uses a non-loopback address, requests must use HTTPS after XStorage applies trusted forwarded headers. Do not expose the admin listener on a public interface. If you bind it to a network interface, use HTTPS termination and restrict access to the operator network.
 
 ## S3 API subset
 
-All requests use path-style addressing and SigV4 with region `us-east-1`, service `s3`, and static application credentials. The server requires signed `host` and `x-amz-date` headers. It accepts an actual lowercase SHA-256 payload hash or `UNSIGNED-PAYLOAD`. It rejects timestamps more than 15 minutes from server time.
+Requests use path-style addressing and AWS Signature Version 4 (SigV4). Sign requests with region `us-east-1`, service `s3`, and the application's static credentials. Include signed `host` and `x-amz-date` headers. For the payload, use its lowercase SHA-256 hash or `UNSIGNED-PAYLOAD`. XStorage rejects request timestamps that differ from server time by more than 15 minutes.
 
-- **Create bucket — `PUT /{bucket}`:** Creates an empty bucket. A body may contain only the `us-east-1` location constraint.
-- **Put object — `PUT /{bucket}/{key}`:** Writes or replaces one whole object. Returns the quoted MD5 ETag.
-- **Get object — `GET /{bucket}/{key}`:** Returns object bytes and metadata.
-- **Head object — `HEAD /{bucket}/{key}`:** Returns metadata without a body.
-- **Delete object — `DELETE /{bucket}/{key}`:** Removes the object. A missing key succeeds.
-- **ListObjectsV2 — `GET /{bucket}?list-type=2`:** Returns one S3 XML page.
+| Operation | Route | Result |
+| --- | --- | --- |
+| Create bucket | `PUT /{bucket}` | Creates an empty bucket. The body may contain only the `us-east-1` location constraint. |
+| Put object | `PUT /{bucket}/{key}` | Writes or replaces one whole object and returns a quoted MD5 ETag. |
+| Get object | `GET /{bucket}/{key}` | Returns object bytes and metadata. |
+| Head object | `HEAD /{bucket}/{key}` | Returns metadata without a body. |
+| Delete object | `DELETE /{bucket}/{key}` | Removes the object. Deleting a missing key succeeds. |
+| ListObjectsV2 | `GET /{bucket}?list-type=2` | Returns one page of S3 XML results. |
 
-The server decodes an object key once. Encoded slashes become slashes in the key. Keys remain case-sensitive and use exact UTF-8 bytes. Listings sort by UTF-8 byte order. Delimiter prefixes count as page entries. Continuation tokens are signed, scoped to the list request, URL-safe, and stable across restarts while the token key stays unchanged. Pages are not snapshots across separate requests. CreateBucket also accepts `PUT /{bucket}/` because the unmodified AWS SDK for .NET uses that path-style form.
+XStorage decodes each object key once. An encoded slash becomes a slash in the key. Keys are case-sensitive and use their exact UTF-8 bytes. Listings sort keys by UTF-8 byte order. A delimiter prefix counts as a page entry. Continuation tokens are signed, URL-safe, and tied to the list request. They remain valid after a restart if the continuation-token key stays the same. Separate list requests do not share a snapshot. The CreateBucket operation also accepts `PUT /{bucket}/`, which the unmodified AWS SDK for .NET sends for path-style requests.
 
-Every S3 response includes `x-amz-request-id`. Errors use S3 XML, except HEAD errors, which have no body. The server checks bucket ownership before key lookup. A different application's bucket returns `AccessDenied`. An unknown bucket returns `NoSuchBucket`.
+Every S3 response includes `x-amz-request-id`. Errors use S3 XML, except for HEAD requests, which return no error body. XStorage checks bucket ownership before it looks up an object key. A bucket owned by another application returns `AccessDenied`; an unknown bucket returns `NoSuchBucket`.
 
-Callers can distinguish an unknown bucket from a bucket owned by another application. The service does not return object keys or metadata across applications.
+These responses let callers distinguish an unknown bucket from a bucket owned by another application. XStorage never returns another application's object keys or metadata.
 
-The service rejects unsupported S3 operations, range and conditional requests, presigned URLs, virtual-hosted addressing, ACLs, object metadata headers, storage-class and tagging headers, request checksums, checksum trailers, session tokens, and SigV4 streaming chunks. It also rejects unknown query options and response override queries. The AWS SDK's `x-amz-api-version` protocol header is accepted as SDK metadata; it does not enable an S3 operation.
+XStorage rejects unsupported operations and request features. These include range and conditional requests, presigned URLs, virtual-hosted addressing, ACLs, object metadata headers, storage-class and tagging headers, request checksums and checksum trailers, session tokens, and SigV4 streaming chunks. It also rejects unknown query options and response-override queries. The AWS SDK's `x-amz-api-version` header is accepted as protocol metadata only; it does not enable an S3 operation.
 
-Other unsupported features include bucket deletion, multipart upload, resumable upload, versioning, lifecycle rules, replication, sharding, cross-application bucket sharing, public object URLs, and AWS S3 control-plane calls.
+XStorage also does not support bucket deletion, multipart or resumable uploads, versioning, lifecycle rules, replication, sharding, bucket sharing between applications, public object URLs, or AWS S3 control-plane calls.
 
 ## Provision applications
 
-Each consuming application receives a separate access key, secret, and quota. Application names are display labels and can repeat. Access key IDs identify applications. The admin listener accepts only the bearer token configured at startup. Create one application per consuming project or trust boundary.
+Create one XStorage application for each consuming project or trust boundary. Each application gets a separate access key, secret, and quota. Names are display labels and can repeat; the access key ID identifies the application. The admin API accepts only the bearer token configured at startup.
 
-For Unix scripts, store a line such as `Authorization: Bearer <token>` in a protected file outside the repository. Set file permissions to `0600`. Pass the file path to curl with `--header @/path/to/admin-header`; do not pass the token as a command argument. The paths below are examples: create the protected header file and credential directory before using them. Store each create or rotate response in a protected credential store because the response contains the secret.
+Every admin request must include `Authorization: Bearer <admin-token>`. The admin API uses the `XSTORAGE_ADMIN_URL` listener. Its default address is `http://127.0.0.1:9001`.
 
-Create an application:
+| Method and route | Purpose | Request / response |
+| --- | --- | --- |
+| `POST /admin/applications` | Create an application. | Send `{"name":"billing","quotaBytes":1073741824}`. Returns the access key and secret once. |
+| `GET /admin/applications` | List applications. | Returns IDs, names, quotas, usage, bucket counts, and active status. Does not return secrets. |
+| `POST /admin/applications/{accessKeyId}/rotate` | Rotate an application's secret. | Returns the new access key ID and secret. |
+| `PATCH /admin/applications/{accessKeyId}` | Change an application's quota. | Send `{"quotaBytes":2147483648}`. |
+| `DELETE /admin/applications/{accessKeyId}` | Deactivate an application. | Returns `204 No Content`. Existing objects remain stored. |
+
+For Unix scripts, put `Authorization: Bearer <token>` in a protected file outside the repository and set its permissions to `0600`. Pass the file path to curl with `--header @/path/to/admin-header`. This keeps the token out of the command arguments. The paths below are examples; create the protected header file and credential directory first. Create and rotate responses contain application secrets, so save them in a protected credential store.
+
+Create an application with a display name and a quota in bytes. This example requests a 1 GiB quota:
 
 ```bash
 umask 077
@@ -115,7 +129,7 @@ curl --silent --show-error --fail-with-body \
   > /secure/credential-store/billing.json
 ```
 
-On Windows, load the admin token from a protected store into the PowerShell session. Then create an application without putting the token on an external command line:
+On Windows, load the admin token from a protected store into your PowerShell session. This example creates an application without placing the token on an external command line:
 
 ```powershell
 $headers = @{ Authorization = "Bearer $env:XSTORAGE_ADMIN_TOKEN" }
@@ -145,7 +159,7 @@ curl --silent --show-error --fail-with-body \
   > /secure/credential-store/billing-new.json
 ```
 
-Rotation is an immediate hard cutover. A request can finish only if it passes SigV4 verification before the rotation response. All other requests that use the old secret fail. Coordinate the update across every running consumer instance before triggering rotation. There is no grace period.
+Secret rotation takes effect immediately. A request using the old secret succeeds only if SigV4 verification finishes before the rotation response. Other requests with the old secret fail. Update every running consumer before you rotate the secret. XStorage provides no overlap period.
 
 Set a quota:
 
@@ -167,22 +181,22 @@ curl --silent --show-error --fail-with-body \
   http://127.0.0.1:9001/admin/applications/ACCESS_KEY_ID
 ```
 
-Deactivation blocks later requests. It keeps the application's buckets and objects. Permanent data deletion is outside this release.
+Deactivation blocks future requests from the application but keeps its buckets and objects. This release does not permanently delete application data.
 
 ## Connect another project
 
-Use the `accessKeyId` and `secretAccessKey` from the application creation response. Point the client at the **S3 endpoint** on port `9000`, not the admin endpoint on port `9001`. Create a bucket for that application before uploading objects. Store credentials in the consuming project's secret store or server environment. Never expose them to browser code.
+Use the `accessKeyId` and `secretAccessKey` returned when you create the application. Configure the client to use the **S3 endpoint** on port `9000`. Do not use the admin endpoint on port `9001` for object requests. Create a bucket before uploading objects. Store credentials in the consuming project's secret store or server environment. Never put them in browser code.
 
 For a .NET 10 project, choose one of these clients:
 
 - Add a project reference to `src/XStorage.Client/XStorage.Client.csproj` and use the [typed client](#optional-net-client-library).
 - Add `AWSSDK.S3` and use the [AWS SDK example](#aws-sdk-for-net). This repository tests version `4.0.103.4`.
 
-For another language, configure an S3 client with a custom service URL, path-style addressing, region `us-east-1`, and the application's static credentials. The client must support the [limited request set](#s3-api-subset). Use HTTPS when connecting across a network.
+For other languages, configure an S3 client with a custom service URL, path-style addressing, region `us-east-1`, and the application's static credentials. The client must support the [operations listed above](#s3-api-subset). Use HTTPS for network connections.
 
 ## AWS SDK for .NET
 
-Consumers can use `AWSSDK.S3` with a custom service URL, path-style addressing, `us-east-1`, and static credentials. Replace the service URL with the HTTPS address of your reverse proxy for remote access:
+A .NET application can use `AWSSDK.S3` with a custom service URL, path-style addressing, region `us-east-1`, and the application's static credentials. For remote access, set the service URL to your reverse proxy's HTTPS address:
 
 ```c#
 using Amazon.Runtime;
@@ -226,11 +240,11 @@ await using var output = File.Create("downloaded-invoice.pdf");
 await download.ResponseStream.CopyToAsync(output);
 ```
 
-PUT streams must be readable, seekable, positioned at zero, and have a known length. The caller owns upload streams and must keep them open until the SDK call completes. The caller must dispose each get response to close its response stream.
+For PUT requests, the upload stream must be readable, seekable, positioned at the start, and have a known length. The caller owns the upload stream and must keep it open until the SDK call completes. Dispose each get response to close its response stream.
 
 ## Optional .NET client library
 
-`XStorage.Client` provides the `IObjectStore` contract and an `AWSSDK.S3` backed `S3ObjectStore`. It sends HTTP requests to the standalone service. It does not access server storage in process. Add a project reference from your .NET 10 application to `src/XStorage.Client/XStorage.Client.csproj`.
+`XStorage.Client` provides the `IObjectStore` interface and an `S3ObjectStore` implementation backed by `AWSSDK.S3`. The client sends HTTP requests to the standalone server; it does not access the server's filesystem directly. Add a project reference to `src/XStorage.Client/XStorage.Client.csproj` from your .NET 10 application.
 
 ```c#
 using XStorage.Client;
@@ -258,9 +272,9 @@ await using var output = File.Create("downloaded-invoice.pdf");
 await download.Content.CopyToAsync(output);
 ```
 
-The caller owns upload streams and must keep them open until `PutObjectAsync` completes. Upload streams must be seekable and positioned at zero. The caller owns each returned `ObjectStoreObject` and must dispose it after reading. `ObjectStoreException` reports the S3 error code, HTTP status, request ID, and message.
+Keep each upload stream open until `PutObjectAsync` completes. Upload streams must be seekable and positioned at the start. The caller owns each returned `ObjectStoreObject` and must dispose it after reading. `ObjectStoreException` includes the S3 error code, HTTP status, request ID, and message.
 
-The `IObjectStore` interface uses `System.IO.Stream`, typed metadata and results, and `CancellationToken`. It exposes no filesystem paths or ASP.NET types. A future S3 or MinIO adapter can implement the same interface.
+`IObjectStore` uses `System.IO.Stream`, typed metadata and results, and `CancellationToken`. It exposes no filesystem paths or ASP.NET types. An adapter for another service, such as S3 or MinIO, can implement the same interface.
 
 ## Build and test
 
@@ -272,15 +286,15 @@ dotnet build XStorage.sln --no-restore
 dotnet test XStorage.sln --no-restore --verbosity minimal -m:1 /p:UseSharedCompilation=false
 ```
 
-The SDK acceptance tests use `AWSSDK.S3` version `4.0.103.4`. They exercise all six supported operations. The Linux child-process crash test runs only on Linux. The Windows ACL test runs only on Windows. Windows filesystem and ACL behavior still needs a Windows test run; power-loss testing has not been done.
+The SDK acceptance tests use `AWSSDK.S3` version `4.0.103.4` and cover all six supported operations. The child-process crash test runs only on Linux. The ACL test runs only on Windows. Windows filesystem and ACL behavior still needs a Windows test run. Power-loss testing has not been done.
 
 ## Quota and object size
 
-The configured maximum object size applies to every application. The default is 25 MiB. A zero-byte limit permits empty objects only. The service rejects an oversized declared length before reading the body and enforces the same limit while it streams an unknown-length body.
+The maximum object size applies to every application. The default is 25 MiB. Set the limit to zero to allow empty objects only. XStorage rejects a request whose declared size is too large before it reads the body. It also enforces the limit while reading a body with unknown length.
 
-Each application's byte quota is shared across all buckets that application owns. The service counts committed object bytes. An overwrite replaces the previous size in the quota total. A delete subtracts the object's size. If an operator lowers quota below current usage, every PUT is blocked until deletes bring usage under quota. Existing objects remain readable and deletable. A PUT that would exceed byte quota returns `InvalidArgument`.
+An application's byte quota covers all buckets it owns. XStorage counts bytes in committed objects. Overwriting an object replaces its previous size in the total; deleting an object subtracts its size. If you lower a quota below current usage, PUT requests remain blocked until deletes bring usage under the new limit. Existing objects stay readable and deletable. A PUT that would exceed the quota returns `InvalidArgument`.
 
-The service also applies per-application object-count and bucket-count limits. The defaults are 10,000 committed objects and 100 buckets. Operators can set each limit at startup with the environment variables above. Empty objects count toward the object limit. Replacing an existing key does not increase the count. Deleting an object releases one slot. A PUT or CreateBucket request that exceeds its count limit returns `InvalidArgument`. Startup rebuilds the object count from committed records.
+XStorage also limits the number of objects and buckets per application. The defaults are 10,000 committed objects and 100 buckets. Set these limits at startup with the environment variables above. Empty objects count. Replacing an existing object does not increase the count, and deleting one frees a slot. A PUT or CreateBucket request that exceeds a limit returns `InvalidArgument`. At startup, XStorage rebuilds the object count from committed records.
 
 ## Data format, recovery, and backups
 
@@ -290,24 +304,42 @@ The data root contains:
 - `state/applications/`: one encrypted JSON record per application.
 - `state/.service.lock`: a process lock that prevents concurrent server processes.
 
-Object records store the exact key, content type, size, SHA-256, MD5 ETag, UTC creation time, and object bytes. The key never becomes a filesystem path. The server hashes exact UTF-8 key bytes to choose the record path. Ownership markers determine bucket ownership. Application bucket indexes and usage counters are derived from those markers and committed records.
+Each object record stores the exact key, content type, size, SHA-256 hash, MD5 ETag, UTC creation time, and object bytes. XStorage never uses an object key as a filesystem path. It hashes the key's exact UTF-8 bytes to choose a record path. Ownership markers determine which application owns each bucket. XStorage derives bucket indexes and usage counters from those markers and committed object records.
 
-At startup, the service removes abandoned temporary files, validates committed records and ownership markers, rebuilds ownership indexes and the in-memory sorted listing index, and reconciles byte usage and object counts. The listing index is a cache. Committed object records remain authoritative. Corrupt committed records stop startup. Runtime integrity failures return `InternalError` and are logged without object bytes or credentials.
+At startup, XStorage removes abandoned temporary files and validates committed records and ownership markers. It then rebuilds ownership indexes and the in-memory sorted listing index, and recalculates byte usage and object counts. The listing index is a cache; committed object records remain authoritative. A corrupt committed record stops startup. Runtime integrity failures return `InternalError`. Logs do not include object bytes or credentials.
 
-Stop the service before copying the data root for a backup. Back up the entire data root and both configured keys. The application encryption key is required to read stored application credentials. Keep the continuation-token key unchanged if existing continuation tokens must remain valid.
+Stop XStorage before copying the data root. Back up the entire data root and both configured encryption and continuation-token keys. XStorage needs the encryption key to read stored application credentials. Keep the continuation-token key unchanged if clients must continue using existing list tokens.
 
-If the application record store is lost while bucket data remains, startup rebuilds application-to-bucket mappings from ownership markers and recalculates usage. Recovered applications appear with the display name `recovered` and a zero-byte quota. Their previous secrets cannot be recovered. Use the admin API to rotate each recovered access key ID, set its quota, and update the consumer's secret. Applications with no bucket marker cannot be reconstructed from bucket data; provision those applications again.
+If XStorage loses its application records but bucket data remains, it rebuilds application-to-bucket mappings from ownership markers and recalculates usage. Recovered applications use the display name `recovered` and a zero-byte quota. Their old secrets cannot be recovered. Use the admin API to rotate each recovered access key, set its quota, and update the consuming project with the new secret. XStorage cannot recover an application that has no bucket ownership marker; create that application again.
 
 ## Durability guarantee
 
-For PUT, the server writes a temporary record in the destination directory, computes hashes, flushes the record, and atomically renames it over the committed path before it updates the durable usage counter. Linux and macOS flush the containing directory. Windows uses `MOVEFILE_WRITE_THROUGH` for committed file and directory renames. For DELETE, Windows durably renames the committed record to a temporary tombstone before cleanup. Startup removes abandoned upload files and tombstones, then reconciles usage. Bucket creation flushes its marker and publishes the directory with the platform's durable rename operation.
+For PUT, XStorage writes a temporary record in the destination directory, computes hashes, flushes the record, and atomically renames it to the committed path. It then updates the durable usage counter. Linux and macOS flush the containing directory. Windows uses `MOVEFILE_WRITE_THROUGH` for committed file and directory renames. For DELETE on Windows, XStorage first renames the committed record to a temporary tombstone using a durable rename, then cleans it up. At startup, XStorage removes abandoned uploads and tombstones, then recalculates usage. Bucket creation flushes the ownership marker and publishes the directory with the platform's durable rename operation.
 
-A crash before object rename leaves only a temporary file, which startup removes. A failure after object rename or deletion rename but before the counter update can return an error while the object change is already visible. Startup reconciliation repairs the derived usage counter. The service does not promise power-loss behavior for hardware that lies about flush completion. Power-loss testing is not claimed.
+A crash before the object rename leaves a temporary file. XStorage removes it at startup. A failure after an object or deletion rename but before the usage-counter update can return an error even though the object change is visible. Startup reconciliation repairs the derived counter. XStorage cannot guarantee power-loss behavior if storage hardware reports a flush as complete before data is durable. Power-loss testing has not been done.
 
 ## Known limits
 
-- One server process and one local filesystem only.
+- One server process and one local filesystem.
 - No replication, sharding, online backup guarantee, lifecycle cleanup, multipart upload, versioning, bucket deletion, presigned URLs, or virtual-hosted addressing.
-- Application authorization does not authorize end users. Each consuming application must authorize its own users.
-- An unknown bucket returns `NoSuchBucket`, while a bucket owned by another application returns `AccessDenied`. This follows the S3 status rules and exposes whether a bucket name exists, as described in the S3 subset section.
+- Application credentials identify the consuming application. Each application must authorize its own users.
+- An unknown bucket returns `NoSuchBucket`; a bucket owned by another application returns `AccessDenied`. This follows the API behavior described in [S3 API subset](#s3-api-subset) and reveals whether a bucket name exists.
 - The Linux-only child-process crash test is skipped on macOS and Windows. Power-loss behavior is not tested.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| The server exits during startup. | Confirm that all four required environment variables are set. Check that both keys decode to 32 bytes, the data root is an absolute path, limits are zero or greater, and the listener URLs do not use the same host and port. |
+| An admin request returns `401`. | Send the exact token configured in `XSTORAGE_ADMIN_TOKEN` as `Authorization: Bearer <admin-token>`. |
+| An admin request returns `403`. | If the admin listener is bound outside loopback, use HTTPS through the trusted proxy. |
+| An S3 request returns `RequestTimeTooSkewed`. | Check that the client clock is synchronized. Request timestamps must be within 15 minutes of server time. |
+| An S3 request returns `SignatureDoesNotMatch`. | Check the access key, secret, region (`us-east-1`), service (`s3`), signed headers, and payload hash. Recheck the canonical path and query if a proxy is in use. |
+| An S3 request returns `AccessDenied`. | Confirm that the application is active and owns the bucket. Sign `host` and `x-amz-date`. Requests using `UNSIGNED-PAYLOAD` require HTTPS. |
+| An S3 request returns `NoSuchBucket`. | Create the bucket with the application's credentials, or check the bucket name. A bucket owned by another application returns `AccessDenied`. |
+| A PUT returns `InvalidArgument`. | Check the maximum object size, application byte quota, object-count limit, bucket-count limit, and object key. Empty objects still count toward the object-count limit. |
+| The old credentials stop working after rotation. | Rotation takes effect immediately. Update every consumer with the new secret. There is no overlap period. |
+| Stored application credentials cannot be read after restart. | Restore the same `XSTORAGE_APP_ENCRYPTION_KEY` used when the credentials were stored. |
+| Startup stops because a committed record is corrupt. | Check the server logs and restore the data root from a known-good backup. Do not edit committed records manually. |
+
+S3 errors use S3 XML. HEAD errors have no body. Admin operation errors use JSON. A missing or invalid admin bearer token returns an empty `401` response.
